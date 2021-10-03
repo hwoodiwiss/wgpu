@@ -36,7 +36,15 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::track::UseExtendError;
-use std::{borrow::Cow, fmt, iter, marker::PhantomData, mem, num::NonZeroU32, ops::Range, str};
+use std::{
+    borrow::{Borrow, Cow},
+    fmt, iter,
+    marker::PhantomData,
+    mem,
+    num::NonZeroU32,
+    ops::Range,
+    str,
+};
 
 /// Operation to perform to the output attachment at the start of a renderpass.
 #[repr(C)]
@@ -350,6 +358,12 @@ impl State {
 
         let bind_mask = self.binder.invalid_mask();
         if bind_mask != 0 {
+            #[cfg(target_arch = "wasm32")]
+            panic!(std::format!(
+                "Binder was invalid, mask value: {:?}, binder: {:?}",
+                bind_mask,
+                self.binder
+            ));
             //let (expected, provided) = self.binder.entries[index as usize].info();
             return Err(DrawError::IncompatibleBindGroup {
                 index: bind_mask.trailing_zeros(),
