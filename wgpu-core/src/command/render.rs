@@ -358,7 +358,6 @@ impl State {
 
         let bind_mask = self.binder.invalid_mask();
         if bind_mask != 0 {
-            #[cfg(target_arch = "wasm32")]
             panic!(std::format!(
                 "Binder was invalid, mask value: {:?}, binder: {:?}",
                 bind_mask,
