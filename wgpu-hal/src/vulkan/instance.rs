@@ -586,10 +586,10 @@ impl crate::Instance<super::Api> for super::Instance {
             }
             #[cfg(windows)]
             RawWindowHandle::Windows(handle) => {
-                use winapi::um::libloaderapi::GetModuleHandleW;
+                use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
-                let hinstance = GetModuleHandleW(std::ptr::null());
-                Ok(self.create_surface_from_hwnd(hinstance as *mut _, handle.hwnd))
+                let hinstance = GetModuleHandleW(None);
+                Ok(self.create_surface_from_hwnd(hinstance.0 as *mut _, handle.hwnd))
             }
             #[cfg(target_os = "macos")]
             RawWindowHandle::MacOS(handle)

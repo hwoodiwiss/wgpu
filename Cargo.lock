@@ -1879,7 +1879,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "wgpu-types",
- "winapi",
+ "windows",
  "winit",
 ]
 
