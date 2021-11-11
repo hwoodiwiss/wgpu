@@ -1,11 +1,8 @@
+use windows::Win32::Foundation;
+use windows::Win32::Graphics::Dxgi;
+
 use super::HResult as _;
 use std::{borrow::Cow, slice, sync::Arc};
-use winapi::{
-    shared::{dxgi, dxgi1_2, dxgi1_6, winerror},
-    um::{errhandlingapi, winnt},
-    vc::excpt,
-    Interface,
-};
 
 const MESSAGE_PREFIXES: &[(&str, log::Level)] = &[
     ("CORRUPTION", log::Level::Error),
@@ -15,8 +12,8 @@ const MESSAGE_PREFIXES: &[(&str, log::Level)] = &[
     ("MESSAGE", log::Level::Debug),
 ];
 
-unsafe extern "system" fn output_debug_string_handler(
-    exception_info: *mut winnt::EXCEPTION_POINTERS,
+/*unsafe extern "system" fn output_debug_string_handler(
+    exception_info: *mut VBS_BASIC_ENCLAVE_EXCEPTION_AMD64,
 ) -> i32 {
     // See https://stackoverflow.com/a/41480827
     let record = &*(*exception_info).ExceptionRecord;
@@ -66,13 +63,13 @@ unsafe extern "system" fn output_debug_string_handler(
     }
 
     excpt::EXCEPTION_CONTINUE_EXECUTION
-}
+}*/
 
 impl Drop for super::Instance {
     fn drop(&mut self) {
         unsafe {
             self.factory.destroy();
-            errhandlingapi::RemoveVectoredExceptionHandler(output_debug_string_handler as *mut _);
+            //errhandlingapi::RemoveVectoredExceptionHandler(output_debug_string_handler as *mut _);
         }
     }
 }
@@ -90,7 +87,7 @@ impl crate::Instance<super::Api> for super::Instance {
                 Ok(pair) => match pair.into_result() {
                     Ok(debug_controller) => {
                         debug_controller.enable_layer();
-                        debug_controller.Release();
+                        debug_controller.destroy();
                     }
                     Err(err) => {
                         log::warn!("Unable to enable D3D12 debug interface: {}", err);
@@ -120,7 +117,7 @@ impl crate::Instance<super::Api> for super::Instance {
             }
 
             // Intercept `OutputDebugString` calls
-            errhandlingapi::AddVectoredExceptionHandler(0, Some(output_debug_string_handler));
+            //AddVectoredContinueHandler(0, Some(output_debug_string_handler));
         }
 
         // Create DXGI factory
@@ -153,7 +150,7 @@ impl crate::Instance<super::Api> for super::Instance {
         match has_handle.raw_window_handle() {
             raw_window_handle::RawWindowHandle::Windows(handle) => Ok(super::Surface {
                 factory: self.factory,
-                wnd_handle: handle.hwnd as *mut _,
+                wnd_handle: handle.hwnd,
                 swap_chain: None,
             }),
             _ => Err(crate::InstanceError),
@@ -165,7 +162,7 @@ impl crate::Instance<super::Api> for super::Instance {
 
     unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<super::Api>> {
         // Try to use high performance order by default (returns None on Windows < 1803)
-        let factory6 = match self.factory.cast::<dxgi1_6::IDXGIFactory6>().into_result() {
+        let factory6 = match self.factory.cast::<Dxgi::IDXGIFactory6>().into_result() {
             Ok(f6) => {
                 // It's okay to decrement the refcount here because we
                 // have another reference to the factory already owned by `self`.
@@ -184,16 +181,17 @@ impl crate::Instance<super::Api> for super::Instance {
             let raw = match factory6 {
                 Some(factory) => {
                     profiling::scope!("IDXGIFactory6::EnumAdapterByGpuPreference");
-                    let mut adapter2 = native::WeakPtr::<dxgi1_2::IDXGIAdapter2>::null();
-                    let hr = factory.EnumAdapterByGpuPreference(
-                        cur_index,
-                        dxgi1_6::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                        &dxgi1_2::IDXGIAdapter2::uuidof(),
-                        adapter2.mut_void(),
-                    );
+                    let mut adapter2 = native::WeakPtr::<Dxgi::IDXGIAdapter2>::null();
+                    let hr = factory
+                        .EnumAdapterByGpuPreference::<native::WeakPtr<Dxgi::IDXGIAdapter2>>(
+                            cur_index,
+                            Dxgi::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                        );
 
-                    if hr == winerror::DXGI_ERROR_NOT_FOUND {
-                        break;
+                    if let Err(ref err) = hr {
+                        if err.code() == Dxgi::DXGI_ERROR_NOT_FOUND {
+                            break;
+                        }
                     }
                     if let Err(err) = hr.into_result() {
                         log::error!("Failed enumerating adapters: {}", err);
@@ -204,20 +202,19 @@ impl crate::Instance<super::Api> for super::Instance {
                 }
                 None => {
                     profiling::scope!("IDXGIFactory1::EnumAdapters1");
-                    let mut adapter1 = native::WeakPtr::<dxgi::IDXGIAdapter1>::null();
-                    let hr = self
-                        .factory
-                        .EnumAdapters1(cur_index, adapter1.mut_void() as *mut *mut _);
+                    let mut adapter1 = native::WeakPtr::<Dxgi::IDXGIAdapter1>::null();
+                    let hr = self.factory.EnumAdapters1(cur_index);
 
-                    if hr == winerror::DXGI_ERROR_NOT_FOUND {
-                        break;
+                    if let Err(ref err) = hr {
+                        if err.code() == Dxgi::DXGI_ERROR_NOT_FOUND {
+                            break;
+                        }
                     }
                     if let Err(err) = hr.into_result() {
                         log::error!("Failed enumerating adapters: {}", err);
                         break;
                     }
-
-                    match adapter1.cast::<dxgi1_2::IDXGIAdapter2>().into_result() {
+                    match adapter1.cast::<Dxgi::IDXGIAdapter2>().into_result() {
                         Ok(adapter2) => {
                             adapter1.destroy();
                             adapter2

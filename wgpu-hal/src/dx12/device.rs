@@ -1,16 +1,20 @@
 use super::{conv, descriptor, view, HResult as _};
 use parking_lot::Mutex;
 use std::{ffi, mem, num::NonZeroU32, ptr, slice, sync::Arc};
-use winapi::{
-    shared::{dxgiformat, dxgitype, winerror},
-    um::{d3d12, d3dcompiler, synchapi, winbase},
-    Interface,
+use windows::{
+    runtime::Interface,
+    Win32::{
+        Foundation,
+        Graphics::{Direct3D11, Direct3D12, Dxgi, Hlsl},
+        System::{Threading, WindowsProgramming},
+    },
 };
 
 // this has to match Naga's HLSL backend, and also needs to be null-terminated
 const NAGA_LOCATION_SEMANTIC: &[u8] = b"LOC\0";
 //TODO: find the exact value
-const D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: u32 = d3d12::D3D12_HEAP_FLAG_NONE;
+const D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: Direct3D12::D3D12_HEAP_FLAGS =
+    Direct3D12::D3D12_HEAP_FLAG_NONE;
 
 impl super::Device {
     pub(super) fn new(
@@ -20,42 +24,36 @@ impl super::Device {
         private_caps: super::PrivateCapabilities,
         library: &Arc<native::D3D12Lib>,
     ) -> Result<Self, crate::DeviceError> {
-        let mut idle_fence = native::Fence::null();
         let hr = unsafe {
             profiling::scope!("ID3D12Device::CreateFence");
-            raw.CreateFence(
-                0,
-                d3d12::D3D12_FENCE_FLAG_NONE,
-                &d3d12::ID3D12Fence::uuidof(),
-                idle_fence.mut_void(),
-            )
+            raw.CreateFence::<native::Fence>(0, Direct3D12::D3D12_FENCE_FLAG_NONE)
         };
-        hr.into_device_result("Idle fence creation")?;
+        let idle_fence = hr.into_device_result("Idle fence creation")?;
 
-        let mut zero_buffer = native::Resource::null();
+        let mut zero_buffer: Option<native::Resource> = None;
         unsafe {
-            let raw_desc = d3d12::D3D12_RESOURCE_DESC {
-                Dimension: d3d12::D3D12_RESOURCE_DIMENSION_BUFFER,
+            let raw_desc = Direct3D12::D3D12_RESOURCE_DESC {
+                Dimension: Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
                 Alignment: 0,
                 Width: super::ZERO_BUFFER_SIZE,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                Format: dxgiformat::DXGI_FORMAT_UNKNOWN,
-                SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+                Format: Dxgi::DXGI_FORMAT_UNKNOWN,
+                SampleDesc: Dxgi::DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
                 },
-                Layout: d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                Flags: d3d12::D3D12_RESOURCE_FLAG_NONE,
+                Layout: Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: Direct3D12::D3D12_RESOURCE_FLAG_NONE,
             };
 
-            let heap_properties = d3d12::D3D12_HEAP_PROPERTIES {
-                Type: d3d12::D3D12_HEAP_TYPE_CUSTOM,
-                CPUPageProperty: d3d12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            let heap_properties = Direct3D12::D3D12_HEAP_PROPERTIES {
+                Type: Direct3D12::D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
                 MemoryPoolPreference: match private_caps.memory_architecture {
-                    super::MemoryArchitecture::Unified { .. } => d3d12::D3D12_MEMORY_POOL_L0,
-                    super::MemoryArchitecture::NonUnified => d3d12::D3D12_MEMORY_POOL_L1,
+                    super::MemoryArchitecture::Unified { .. } => Direct3D12::D3D12_MEMORY_POOL_L0,
+                    super::MemoryArchitecture::NonUnified => Direct3D12::D3D12_MEMORY_POOL_L1,
                 },
                 CreationNodeMask: 0,
                 VisibleNodeMask: 0,
@@ -64,12 +62,11 @@ impl super::Device {
             profiling::scope!("Zero Buffer Allocation");
             raw.CreateCommittedResource(
                 &heap_properties,
-                d3d12::D3D12_HEAP_FLAG_NONE,
+                Direct3D12::D3D12_HEAP_FLAG_NONE,
                 &raw_desc,
-                d3d12::D3D12_RESOURCE_STATE_COMMON,
+                Direct3D12::D3D12_RESOURCE_STATE_COMMON,
                 ptr::null(),
-                &d3d12::ID3D12Resource::uuidof(),
-                zero_buffer.mut_void(),
+                &mut zero_buffer,
             )
             .into_device_result("Zero buffer creation")?;
 
@@ -77,6 +74,8 @@ impl super::Device {
             // this resource is zeroed by default.
         };
 
+        //This will have been filled if CreateCommittedResource was not error
+        let zero_buffer = zero_buffer.unwrap();
         // maximum number of CBV/SRV/UAV descriptors in heap for Tier 1
         let capacity_views = 1_000_000;
         let capacity_samplers = 2_048;
@@ -88,7 +87,7 @@ impl super::Device {
                 draw: raw
                     .create_command_signature(
                         native::RootSignature::null(),
-                        &[native::IndirectArgument::draw()],
+                        &mut [native::IndirectArgument::draw()],
                         mem::size_of::<wgt::DrawIndirectArgs>() as u32,
                         0,
                     )
@@ -96,7 +95,7 @@ impl super::Device {
                 draw_indexed: raw
                     .create_command_signature(
                         native::RootSignature::null(),
-                        &[native::IndirectArgument::draw_indexed()],
+                        &mut [native::IndirectArgument::draw_indexed()],
                         mem::size_of::<wgt::DrawIndexedIndirectArgs>() as u32,
                         0,
                     )
@@ -104,7 +103,7 @@ impl super::Device {
                 dispatch: raw
                     .create_command_signature(
                         native::RootSignature::null(),
-                        &[native::IndirectArgument::dispatch()],
+                        &mut [native::IndirectArgument::dispatch()],
                         mem::size_of::<wgt::DispatchIndirectArgs>() as u32,
                         0,
                     )
@@ -167,7 +166,7 @@ impl super::Device {
             .fence
             .set_event_on_completion(self.idler.event, value);
         hr.into_device_result("Set event")?;
-        synchapi::WaitForSingleObject(self.idler.event.0, winbase::INFINITE);
+        Threading::WaitForSingleObject(self.idler.event.0, WindowsProgramming::INFINITE);
         Ok(())
     }
 
@@ -191,7 +190,7 @@ impl super::Device {
                 .map_err(|e| crate::PipelineError::Linkage(stage_bit, format!("HLSL: {:?}", e)))?
         };
 
-        let full_stage = format!(
+        let mut full_stage = format!(
             "{}_{}\0",
             naga_stage.to_hlsl_str(),
             layout.naga_options.shader_model.to_str()
@@ -201,57 +200,58 @@ impl super::Device {
             .iter()
             .position(|ep| ep.stage == naga_stage && ep.name == stage.entry_point)
             .ok_or(crate::PipelineError::EntryPoint(naga_stage))?;
-        let raw_ep = reflection_info.entry_point_names[ep_index]
+        let mut raw_ep = reflection_info.entry_point_names[ep_index]
             .as_ref()
-            .map(|name| ffi::CString::new(name.as_str()).unwrap())
+            .map(|name| Vec::from(name.as_bytes()))
             .map_err(|e| crate::PipelineError::Linkage(stage_bit, format!("{}", e)))?;
 
-        let mut shader_data = native::Blob::null();
-        let mut error = native::Blob::null();
-        let mut compile_flags = d3dcompiler::D3DCOMPILE_ENABLE_STRICTNESS;
+        let mut shader_data: Option<Direct3D11::ID3DBlob> = None;
+        let mut error: Option<Direct3D11::ID3DBlob> = None;
+        let mut compile_flags = Hlsl::D3DCOMPILE_ENABLE_STRICTNESS;
         if self
             .private_caps
             .instance_flags
             .contains(crate::InstanceFlags::DEBUG)
         {
-            compile_flags |=
-                d3dcompiler::D3DCOMPILE_DEBUG | d3dcompiler::D3DCOMPILE_SKIP_OPTIMIZATION;
+            compile_flags |= Hlsl::D3DCOMPILE_DEBUG | Hlsl::D3DCOMPILE_SKIP_OPTIMIZATION;
         }
         if self
             .shared
             .features
             .contains(wgt::Features::UNSIZED_BINDING_ARRAY)
         {
-            compile_flags |= d3dcompiler::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
+            compile_flags |= Hlsl::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
         }
 
-        let source_name = match stage.module.raw_name {
-            Some(ref cstr) => cstr.as_c_str().as_ptr(),
-            None => ptr::null(),
-        };
+        let source_name = stage
+            .module
+            .raw_name
+            .as_ref()
+            .map(|ref mut s| Vec::from(s.as_bytes_with_nul()))
+            .map(|ref mut m| Foundation::PSTR(m.as_mut_ptr()));
 
         let hr = unsafe {
             profiling::scope!("d3dcompiler::D3DCompile");
-            d3dcompiler::D3DCompile(
-                source.as_ptr() as *const _,
+            Hlsl::D3DCompile(
+                source.as_str().as_ptr() as *const _,
                 source.len(),
                 source_name,
                 ptr::null(),
-                ptr::null_mut(),
-                raw_ep.as_ptr(),
-                full_stage.as_ptr() as *const i8,
+                None,
+                Foundation::PSTR(raw_ep.as_mut_ptr()),
+                Foundation::PSTR(full_stage.as_mut_ptr()),
                 compile_flags,
                 0,
-                shader_data.mut_void() as *mut *mut _,
-                error.mut_void() as *mut *mut _,
+                &mut shader_data,
+                &mut error,
             )
         };
 
         let (result, log_level) = match hr.into_result() {
-            Ok(()) => (Ok(shader_data), log::Level::Info),
+            Ok(()) => (Ok(shader_data.unwrap()), log::Level::Info),
             Err(e) => {
                 let mut full_msg = format!("D3DCompile error ({})", e);
-                if !error.is_null() {
+                if let Some(error) = error {
                     use std::fmt::Write as _;
                     let message = unsafe {
                         slice::from_raw_parts(
@@ -260,9 +260,7 @@ impl super::Device {
                         )
                     };
                     let _ = write!(full_msg, ": {}", String::from_utf8_lossy(message));
-                    unsafe {
-                        error.destroy();
-                    }
+                    drop(error.0);
                 }
                 (
                     Err(crate::PipelineError::Linkage(stage_bit, full_msg)),
@@ -278,7 +276,7 @@ impl super::Device {
             naga_stage,
             source
         );
-        result
+        result.map(|mut blob| unsafe { native::WeakPtr::from_raw(&mut blob) })
     }
 
     pub unsafe fn texture_from_raw(
@@ -315,46 +313,46 @@ impl crate::Device<super::Api> for super::Device {
         &self,
         desc: &crate::BufferDescriptor,
     ) -> Result<super::Buffer, crate::DeviceError> {
-        let mut resource = native::Resource::null();
+        let mut resource: Option<native::Resource> = None;
         let mut size = desc.size;
         if desc.usage.contains(crate::BufferUses::UNIFORM) {
-            let align_mask = d3d12::D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64 - 1;
+            let align_mask = Direct3D12::D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64 - 1;
             size = ((size - 1) | align_mask) + 1;
         }
 
-        let raw_desc = d3d12::D3D12_RESOURCE_DESC {
-            Dimension: d3d12::D3D12_RESOURCE_DIMENSION_BUFFER,
+        let raw_desc = Direct3D12::D3D12_RESOURCE_DESC {
+            Dimension: Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
             Alignment: 0,
             Width: size,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            Format: dxgiformat::DXGI_FORMAT_UNKNOWN,
-            SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+            Format: Dxgi::DXGI_FORMAT_UNKNOWN,
+            SampleDesc: Dxgi::DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
-            Layout: d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Layout: Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: conv::map_buffer_usage_to_resource_flags(desc.usage),
         };
 
         let is_cpu_read = desc.usage.contains(crate::BufferUses::MAP_READ);
         let is_cpu_write = desc.usage.contains(crate::BufferUses::MAP_WRITE);
 
-        let heap_properties = d3d12::D3D12_HEAP_PROPERTIES {
-            Type: d3d12::D3D12_HEAP_TYPE_CUSTOM,
+        let heap_properties = Direct3D12::D3D12_HEAP_PROPERTIES {
+            Type: Direct3D12::D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: if is_cpu_read {
-                d3d12::D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                Direct3D12::D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
             } else if is_cpu_write {
-                d3d12::D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+                Direct3D12::D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
             } else {
-                d3d12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE
+                Direct3D12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE
             },
             MemoryPoolPreference: match self.private_caps.memory_architecture {
                 super::MemoryArchitecture::NonUnified if !is_cpu_read && !is_cpu_write => {
-                    d3d12::D3D12_MEMORY_POOL_L1
+                    Direct3D12::D3D12_MEMORY_POOL_L1
                 }
-                _ => d3d12::D3D12_MEMORY_POOL_L0,
+                _ => Direct3D12::D3D12_MEMORY_POOL_L0,
             },
             CreationNodeMask: 0,
             VisibleNodeMask: 0,
@@ -365,19 +363,19 @@ impl crate::Device<super::Api> for super::Device {
             if self.private_caps.heap_create_not_zeroed {
                 D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
             } else {
-                d3d12::D3D12_HEAP_FLAG_NONE
+                Direct3D12::D3D12_HEAP_FLAG_NONE
             },
             &raw_desc,
-            d3d12::D3D12_RESOURCE_STATE_COMMON,
+            Direct3D12::D3D12_RESOURCE_STATE_COMMON,
             ptr::null(),
-            &d3d12::ID3D12Resource::uuidof(),
-            resource.mut_void(),
+            &mut resource,
         );
 
         hr.into_device_result("Buffer creation")?;
+        let resource = resource.unwrap();
         if let Some(label) = desc.label {
-            let cwstr = conv::map_label(label);
-            resource.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            resource.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::Buffer { resource, size })
@@ -411,9 +409,9 @@ impl crate::Device<super::Api> for super::Device {
         &self,
         desc: &crate::TextureDescriptor,
     ) -> Result<super::Texture, crate::DeviceError> {
-        let mut resource = native::Resource::null();
+        let mut resource: Option<native::Resource> = None;
 
-        let raw_desc = d3d12::D3D12_RESOURCE_DESC {
+        let raw_desc = Direct3D12::D3D12_RESOURCE_DESC {
             Dimension: conv::map_texture_dimension(desc.dimension),
             Alignment: 0,
             Width: desc.size.width as u64,
@@ -434,20 +432,20 @@ impl crate::Device<super::Api> for super::Device {
                 // `D3D12_FEATURE_D3D12_OPTIONS3::CastingFullyTypedFormatSupported`
                 conv::map_texture_format_depth_typeless(desc.format)
             },
-            SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+            SampleDesc: Dxgi::DXGI_SAMPLE_DESC {
                 Count: desc.sample_count,
                 Quality: 0,
             },
-            Layout: d3d12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Layout: Direct3D12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: conv::map_texture_usage_to_resource_flags(desc.usage),
         };
 
-        let heap_properties = d3d12::D3D12_HEAP_PROPERTIES {
-            Type: d3d12::D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: d3d12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        let heap_properties = Direct3D12::D3D12_HEAP_PROPERTIES {
+            Type: Direct3D12::D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
             MemoryPoolPreference: match self.private_caps.memory_architecture {
-                super::MemoryArchitecture::NonUnified => d3d12::D3D12_MEMORY_POOL_L1,
-                super::MemoryArchitecture::Unified { .. } => d3d12::D3D12_MEMORY_POOL_L0,
+                super::MemoryArchitecture::NonUnified => Direct3D12::D3D12_MEMORY_POOL_L1,
+                super::MemoryArchitecture::Unified { .. } => Direct3D12::D3D12_MEMORY_POOL_L0,
             },
             CreationNodeMask: 0,
             VisibleNodeMask: 0,
@@ -458,19 +456,19 @@ impl crate::Device<super::Api> for super::Device {
             if self.private_caps.heap_create_not_zeroed {
                 D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
             } else {
-                d3d12::D3D12_HEAP_FLAG_NONE
+                Direct3D12::D3D12_HEAP_FLAG_NONE
             },
             &raw_desc,
-            d3d12::D3D12_RESOURCE_STATE_COMMON,
+            Direct3D12::D3D12_RESOURCE_STATE_COMMON,
             ptr::null(), // clear value
-            &d3d12::ID3D12Resource::uuidof(),
-            resource.mut_void(),
+            &mut resource,
         );
 
         hr.into_device_result("Texture creation")?;
+        let resource = resource.unwrap();
         if let Some(label) = desc.label {
-            let cwstr = conv::map_label(label);
-            resource.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            resource.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::Texture {
@@ -503,7 +501,11 @@ impl crate::Device<super::Api> for super::Device {
                 let raw_desc = view_desc.to_srv();
                 let handle = self.srv_uav_pool.lock().alloc_handle();
                 self.raw.CreateShaderResourceView(
-                    texture.resource.as_mut_ptr(),
+                    texture
+                        .resource
+                        .as_unknown()
+                        .cast::<Direct3D12::ID3D12Resource>()
+                        .unwrap(),
                     &raw_desc,
                     handle.raw,
                 );
@@ -518,8 +520,12 @@ impl crate::Device<super::Api> for super::Device {
                 let raw_desc = view_desc.to_uav();
                 let handle = self.srv_uav_pool.lock().alloc_handle();
                 self.raw.CreateUnorderedAccessView(
-                    texture.resource.as_mut_ptr(),
-                    ptr::null_mut(),
+                    texture
+                        .resource
+                        .as_unknown()
+                        .cast::<Direct3D12::ID3D12Resource>()
+                        .unwrap(),
+                    None,
                     &raw_desc,
                     handle.raw,
                 );
@@ -531,7 +537,11 @@ impl crate::Device<super::Api> for super::Device {
                 let raw_desc = view_desc.to_rtv();
                 let handle = self.rtv_pool.lock().alloc_handle();
                 self.raw.CreateRenderTargetView(
-                    texture.resource.as_mut_ptr(),
+                    texture
+                        .resource
+                        .as_unknown()
+                        .cast::<Direct3D12::ID3D12Resource>()
+                        .unwrap(),
                     &raw_desc,
                     handle.raw,
                 );
@@ -546,7 +556,11 @@ impl crate::Device<super::Api> for super::Device {
                 let raw_desc = view_desc.to_dsv(desc.format.into());
                 let handle = self.dsv_pool.lock().alloc_handle();
                 self.raw.CreateDepthStencilView(
-                    texture.resource.as_mut_ptr(),
+                    texture
+                        .resource
+                        .as_unknown()
+                        .cast::<Direct3D12::ID3D12Resource>()
+                        .unwrap(),
                     &raw_desc,
                     handle.raw,
                 );
@@ -561,7 +575,11 @@ impl crate::Device<super::Api> for super::Device {
                 let raw_desc = view_desc.to_dsv(crate::FormatAspects::empty());
                 let handle = self.dsv_pool.lock().alloc_handle();
                 self.raw.CreateDepthStencilView(
-                    texture.resource.as_mut_ptr(),
+                    texture
+                        .resource
+                        .as_unknown()
+                        .cast::<Direct3D12::ID3D12Resource>()
+                        .unwrap(),
                     &raw_desc,
                     handle.raw,
                 );
@@ -602,20 +620,20 @@ impl crate::Device<super::Api> for super::Device {
         let handle = self.sampler_pool.lock().alloc_handle();
 
         let reduction = match desc.compare {
-            Some(_) => d3d12::D3D12_FILTER_REDUCTION_TYPE_COMPARISON,
-            None => d3d12::D3D12_FILTER_REDUCTION_TYPE_STANDARD,
+            Some(_) => Direct3D12::D3D12_FILTER_REDUCTION_TYPE_COMPARISON,
+            None => Direct3D12::D3D12_FILTER_REDUCTION_TYPE_STANDARD,
         };
-        let filter = conv::map_filter_mode(desc.min_filter) << d3d12::D3D12_MIN_FILTER_SHIFT
-            | conv::map_filter_mode(desc.mag_filter) << d3d12::D3D12_MAG_FILTER_SHIFT
-            | conv::map_filter_mode(desc.mipmap_filter) << d3d12::D3D12_MIP_FILTER_SHIFT
-            | reduction << d3d12::D3D12_FILTER_REDUCTION_TYPE_SHIFT
+        let filter = conv::map_filter_mode(desc.min_filter).0 << Direct3D12::D3D12_MIN_FILTER_SHIFT
+            | conv::map_filter_mode(desc.mag_filter).0 << Direct3D12::D3D12_MAG_FILTER_SHIFT
+            | conv::map_filter_mode(desc.mipmap_filter).0 << Direct3D12::D3D12_MIP_FILTER_SHIFT
+            | reduction.0 << Direct3D12::D3D12_FILTER_REDUCTION_TYPE_SHIFT
             | desc
                 .anisotropy_clamp
-                .map_or(0, |_| d3d12::D3D12_FILTER_ANISOTROPIC);
+                .map_or(0, |_| Direct3D12::D3D12_FILTER_ANISOTROPIC.0);
 
         self.raw.create_sampler(
             handle.raw,
-            filter,
+            Direct3D12::D3D12_FILTER(filter),
             [
                 conv::map_address_mode(desc.address_modes[0]),
                 conv::map_address_mode(desc.address_modes[1]),
@@ -644,8 +662,8 @@ impl crate::Device<super::Api> for super::Device {
             .into_device_result("Command allocator creation")?;
 
         if let Some(label) = desc.label {
-            let cwstr = conv::map_label(label);
-            allocator.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            allocator.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::CommandEncoder {
@@ -848,7 +866,7 @@ impl crate::Device<super::Api> for super::Device {
                     range_ty,
                     entry.count.map_or(1, |count| count.get()),
                     native_binding(bt),
-                    d3d12::D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                    Direct3D12::D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 ));
                 bt.register += 1;
             }
@@ -884,7 +902,7 @@ impl crate::Device<super::Api> for super::Device {
                     range_ty,
                     entry.count.map_or(1, |count| count.get()),
                     native_binding(&bind_sampler),
-                    d3d12::D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                    Direct3D12::D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 ));
                 bind_sampler.register += 1;
             }
@@ -917,17 +935,17 @@ impl crate::Device<super::Api> for super::Device {
                 let (kind, parameter_ty, bt) = match buffer_ty {
                     wgt::BufferBindingType::Uniform => (
                         super::BufferViewKind::Constant,
-                        d3d12::D3D12_ROOT_PARAMETER_TYPE_CBV,
+                        Direct3D12::D3D12_ROOT_PARAMETER_TYPE_CBV,
                         &mut bind_cbv,
                     ),
                     wgt::BufferBindingType::Storage { read_only: true } => (
                         super::BufferViewKind::ShaderResource,
-                        d3d12::D3D12_ROOT_PARAMETER_TYPE_SRV,
+                        Direct3D12::D3D12_ROOT_PARAMETER_TYPE_SRV,
                         &mut bind_srv,
                     ),
                     wgt::BufferBindingType::Storage { read_only: false } => (
                         super::BufferViewKind::UnorderedAccess,
-                        d3d12::D3D12_ROOT_PARAMETER_TYPE_UAV,
+                        Direct3D12::D3D12_ROOT_PARAMETER_TYPE_UAV,
                         &mut bind_uav,
                     ),
                 };
@@ -987,7 +1005,7 @@ impl crate::Device<super::Api> for super::Device {
             .library
             .serialize_root_signature(
                 native::RootSignatureVersion::V1_0,
-                &parameters,
+                &mut parameters[..],
                 &[],
                 native::RootSignatureFlags::ALLOW_IA_INPUT_LAYOUT,
             )
@@ -1015,8 +1033,8 @@ impl crate::Device<super::Api> for super::Device {
         log::debug!("\traw = {:?}", raw);
 
         if let Some(label) = desc.label {
-            let cwstr = conv::map_label(label);
-            raw.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            raw.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::PipelineLayout {
@@ -1079,49 +1097,57 @@ impl crate::Device<super::Api> for super::Device {
                     match ty {
                         wgt::BufferBindingType::Uniform => {
                             let size_mask =
-                                d3d12::D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1;
-                            let raw_desc = d3d12::D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                                Direct3D12::D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1;
+                            let raw_desc = Direct3D12::D3D12_CONSTANT_BUFFER_VIEW_DESC {
                                 BufferLocation: gpu_address,
                                 SizeInBytes: ((size - 1) | size_mask) + 1,
                             };
                             self.raw.CreateConstantBufferView(&raw_desc, handle);
                         }
                         wgt::BufferBindingType::Storage { read_only: true } => {
-                            let mut raw_desc = d3d12::D3D12_SHADER_RESOURCE_VIEW_DESC {
-                                Format: dxgiformat::DXGI_FORMAT_R32_TYPELESS,
+                            let mut raw_desc = Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: Dxgi::DXGI_FORMAT_R32_TYPELESS,
                                 Shader4ComponentMapping:
                                     view::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                                ViewDimension: d3d12::D3D12_SRV_DIMENSION_BUFFER,
-                                u: mem::zeroed(),
+                                ViewDimension: Direct3D12::D3D12_SRV_DIMENSION_BUFFER,
+                                Anonymous: mem::zeroed(),
                             };
-                            *raw_desc.u.Buffer_mut() = d3d12::D3D12_BUFFER_SRV {
+                            raw_desc.Anonymous.Buffer = Direct3D12::D3D12_BUFFER_SRV {
                                 FirstElement: data.offset / 4,
                                 NumElements: size / 4,
                                 StructureByteStride: 0,
-                                Flags: d3d12::D3D12_BUFFER_SRV_FLAG_RAW,
+                                Flags: Direct3D12::D3D12_BUFFER_SRV_FLAG_RAW,
                             };
                             self.raw.CreateShaderResourceView(
-                                data.buffer.resource.as_mut_ptr(),
+                                data.buffer
+                                    .resource
+                                    .as_unknown()
+                                    .cast::<Direct3D12::ID3D12Resource>()
+                                    .unwrap(),
                                 &raw_desc,
                                 handle,
                             );
                         }
                         wgt::BufferBindingType::Storage { read_only: false } => {
-                            let mut raw_desc = d3d12::D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                                Format: dxgiformat::DXGI_FORMAT_R32_TYPELESS,
-                                ViewDimension: d3d12::D3D12_UAV_DIMENSION_BUFFER,
-                                u: mem::zeroed(),
+                            let mut raw_desc = Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                Format: Dxgi::DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: Direct3D12::D3D12_UAV_DIMENSION_BUFFER,
+                                Anonymous: mem::zeroed(),
                             };
-                            *raw_desc.u.Buffer_mut() = d3d12::D3D12_BUFFER_UAV {
+                            raw_desc.Anonymous.Buffer = Direct3D12::D3D12_BUFFER_UAV {
                                 FirstElement: data.offset / 4,
                                 NumElements: size / 4,
                                 StructureByteStride: 0,
                                 CounterOffsetInBytes: 0,
-                                Flags: d3d12::D3D12_BUFFER_UAV_FLAG_RAW,
+                                Flags: Direct3D12::D3D12_BUFFER_UAV_FLAG_RAW,
                             };
                             self.raw.CreateUnorderedAccessView(
-                                data.buffer.resource.as_mut_ptr(),
-                                ptr::null_mut(),
+                                data.buffer
+                                    .resource
+                                    .as_unknown()
+                                    .cast::<Direct3D12::ID3D12Resource>()
+                                    .unwrap(),
+                                None,
                                 &raw_desc,
                                 handle,
                             );
@@ -1230,15 +1256,15 @@ impl crate::Device<super::Api> for super::Device {
             *stride = NonZeroU32::new(vbuf.array_stride as u32);
             let (slot_class, step_rate) = match vbuf.step_mode {
                 wgt::VertexStepMode::Vertex => {
-                    (d3d12::D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0)
+                    (Direct3D12::D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0)
                 }
                 wgt::VertexStepMode::Instance => {
-                    (d3d12::D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1)
+                    (Direct3D12::D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1)
                 }
             };
             for attribute in vbuf.attributes {
-                input_element_descs.push(d3d12::D3D12_INPUT_ELEMENT_DESC {
-                    SemanticName: NAGA_LOCATION_SEMANTIC.as_ptr() as *const _,
+                input_element_descs.push(Direct3D12::D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: Foundation::PSTR(Vec::from(NAGA_LOCATION_SEMANTIC).as_mut_ptr()),
                     SemanticIndex: attribute.shader_location,
                     Format: conv::map_vertex_format(attribute.format),
                     InputSlot: i as u32,
@@ -1249,8 +1275,8 @@ impl crate::Device<super::Api> for super::Device {
             }
         }
 
-        let mut rtv_formats = [dxgiformat::DXGI_FORMAT_UNKNOWN;
-            d3d12::D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize];
+        let mut rtv_formats = [Dxgi::DXGI_FORMAT_UNKNOWN;
+            Direct3D12::D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize];
         for (rtv_format, ct) in rtv_formats.iter_mut().zip(desc.color_targets) {
             *rtv_format = conv::map_texture_format(ct.format);
         }
@@ -1261,33 +1287,48 @@ impl crate::Device<super::Api> for super::Device {
             .map(|ds| ds.bias)
             .unwrap_or_default();
 
-        let raw_rasterizer = d3d12::D3D12_RASTERIZER_DESC {
+        let raw_rasterizer = Direct3D12::D3D12_RASTERIZER_DESC {
             FillMode: conv::map_polygon_mode(desc.primitive.polygon_mode),
             CullMode: match desc.primitive.cull_mode {
-                None => d3d12::D3D12_CULL_MODE_NONE,
-                Some(wgt::Face::Front) => d3d12::D3D12_CULL_MODE_FRONT,
-                Some(wgt::Face::Back) => d3d12::D3D12_CULL_MODE_BACK,
+                None => Direct3D12::D3D12_CULL_MODE_NONE,
+                Some(wgt::Face::Front) => Direct3D12::D3D12_CULL_MODE_FRONT,
+                Some(wgt::Face::Back) => Direct3D12::D3D12_CULL_MODE_BACK,
             },
             FrontCounterClockwise: match desc.primitive.front_face {
-                wgt::FrontFace::Cw => 0,
-                wgt::FrontFace::Ccw => 1,
+                wgt::FrontFace::Cw => Foundation::BOOL(0),
+                wgt::FrontFace::Ccw => Foundation::BOOL(1),
             },
             DepthBias: bias.constant,
             DepthBiasClamp: bias.clamp,
             SlopeScaledDepthBias: bias.slope_scale,
-            DepthClipEnable: if desc.primitive.clamp_depth { 0 } else { 1 },
-            MultisampleEnable: if desc.multisample.count > 1 { 1 } else { 0 },
-            ForcedSampleCount: 0,
-            AntialiasedLineEnable: 0,
-            ConservativeRaster: if desc.primitive.conservative {
-                d3d12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+            DepthClipEnable: if desc.primitive.clamp_depth {
+                Foundation::BOOL(0)
             } else {
-                d3d12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF
+                Foundation::BOOL(1)
+            },
+            MultisampleEnable: if desc.multisample.count > 1 {
+                Foundation::BOOL(1)
+            } else {
+                Foundation::BOOL(0)
+            },
+            ForcedSampleCount: 0,
+            AntialiasedLineEnable: Foundation::BOOL(0),
+            ConservativeRaster: if desc.primitive.conservative {
+                Direct3D12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+            } else {
+                Direct3D12::D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF
             },
         };
 
-        let raw_desc = d3d12::D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-            pRootSignature: desc.layout.shared.signature.as_mut_ptr(),
+        let raw_desc = Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: Some(
+                desc.layout
+                    .shared
+                    .signature
+                    .as_unknown()
+                    .cast::<_>()
+                    .unwrap(),
+            ),
             VS: *native::Shader::from_blob(blob_vs),
             PS: if blob_fs.is_null() {
                 *native::Shader::null()
@@ -1297,20 +1338,20 @@ impl crate::Device<super::Api> for super::Device {
             GS: *native::Shader::null(),
             DS: *native::Shader::null(),
             HS: *native::Shader::null(),
-            StreamOutput: d3d12::D3D12_STREAM_OUTPUT_DESC {
-                pSODeclaration: ptr::null(),
+            StreamOutput: Direct3D12::D3D12_STREAM_OUTPUT_DESC {
+                pSODeclaration: ptr::null_mut(),
                 NumEntries: 0,
-                pBufferStrides: ptr::null(),
+                pBufferStrides: ptr::null_mut(),
                 NumStrides: 0,
                 RasterizedStream: 0,
             },
-            BlendState: d3d12::D3D12_BLEND_DESC {
+            BlendState: Direct3D12::D3D12_BLEND_DESC {
                 AlphaToCoverageEnable: if desc.multisample.alpha_to_coverage_enabled {
-                    1
+                    Foundation::BOOL(1)
                 } else {
-                    0
+                    Foundation::BOOL(0)
                 },
-                IndependentBlendEnable: 1,
+                IndependentBlendEnable: Foundation::BOOL(1),
                 RenderTarget: conv::map_render_targets(desc.color_targets),
             },
             SampleMask: desc.multisample.mask as u32,
@@ -1319,20 +1360,22 @@ impl crate::Device<super::Api> for super::Device {
                 Some(ref ds) => conv::map_depth_stencil(ds),
                 None => mem::zeroed(),
             },
-            InputLayout: d3d12::D3D12_INPUT_LAYOUT_DESC {
+            InputLayout: Direct3D12::D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: if input_element_descs.is_empty() {
-                    ptr::null()
+                    ptr::null_mut()
                 } else {
-                    input_element_descs.as_ptr()
+                    input_element_descs.as_mut_ptr()
                 },
                 NumElements: input_element_descs.len() as u32,
             },
             IBStripCutValue: match desc.primitive.strip_index_format {
-                Some(wgt::IndexFormat::Uint16) => d3d12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF,
-                Some(wgt::IndexFormat::Uint32) => {
-                    d3d12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                Some(wgt::IndexFormat::Uint16) => {
+                    Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
                 }
-                None => d3d12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+                Some(wgt::IndexFormat::Uint32) => {
+                    Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                }
+                None => Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             },
             PrimitiveTopologyType: topology_class,
             NumRenderTargets: desc.color_targets.len() as u32,
@@ -1340,29 +1383,25 @@ impl crate::Device<super::Api> for super::Device {
             DSVFormat: desc
                 .depth_stencil
                 .as_ref()
-                .map_or(dxgiformat::DXGI_FORMAT_UNKNOWN, |ds| {
+                .map_or(Dxgi::DXGI_FORMAT_UNKNOWN, |ds| {
                     conv::map_texture_format(ds.format)
                 }),
-            SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+            SampleDesc: Dxgi::DXGI_SAMPLE_DESC {
                 Count: desc.multisample.count,
                 Quality: 0,
             },
             NodeMask: 0,
-            CachedPSO: d3d12::D3D12_CACHED_PIPELINE_STATE {
-                pCachedBlob: ptr::null(),
+            CachedPSO: Direct3D12::D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: ptr::null_mut(),
                 CachedBlobSizeInBytes: 0,
             },
-            Flags: d3d12::D3D12_PIPELINE_STATE_FLAG_NONE,
+            Flags: Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE,
         };
 
-        let mut raw = native::PipelineState::null();
         let hr = {
             profiling::scope!("ID3D12Device::CreateGraphicsPipelineState");
-            self.raw.CreateGraphicsPipelineState(
-                &raw_desc,
-                &d3d12::ID3D12PipelineState::uuidof(),
-                raw.mut_void(),
-            )
+            self.raw
+                .CreateGraphicsPipelineState::<native::PipelineState>(&raw_desc)
         };
 
         blob_vs.destroy();
@@ -1370,12 +1409,13 @@ impl crate::Device<super::Api> for super::Device {
             blob_fs.destroy();
         }
 
-        hr.into_result()
+        let raw = hr
+            .into_result()
             .map_err(|err| crate::PipelineError::Linkage(shader_stages, err.into_owned()))?;
 
         if let Some(name) = desc.label {
-            let cwstr = conv::map_label(name);
-            raw.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(name);
+            raw.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::RenderPipeline {
@@ -1413,8 +1453,8 @@ impl crate::Device<super::Api> for super::Device {
         })?;
 
         if let Some(name) = desc.label {
-            let cwstr = conv::map_label(name);
-            raw.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(name);
+            raw.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::ComputePipeline {
@@ -1433,15 +1473,15 @@ impl crate::Device<super::Api> for super::Device {
         let (heap_ty, raw_ty) = match desc.ty {
             wgt::QueryType::Occlusion => (
                 native::QueryHeapType::Occlusion,
-                d3d12::D3D12_QUERY_TYPE_BINARY_OCCLUSION,
+                Direct3D12::D3D12_QUERY_TYPE_BINARY_OCCLUSION,
             ),
             wgt::QueryType::PipelineStatistics(_) => (
                 native::QueryHeapType::PipelineStatistics,
-                d3d12::D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                Direct3D12::D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
             ),
             wgt::QueryType::Timestamp => (
                 native::QueryHeapType::Timestamp,
-                d3d12::D3D12_QUERY_TYPE_TIMESTAMP,
+                Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP,
             ),
         };
 
@@ -1451,8 +1491,8 @@ impl crate::Device<super::Api> for super::Device {
             .into_device_result("Query heap creation")?;
 
         if let Some(label) = desc.label {
-            let cwstr = conv::map_label(label);
-            raw.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            raw.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         Ok(super::QuerySet { raw, raw_ty })
@@ -1462,14 +1502,10 @@ impl crate::Device<super::Api> for super::Device {
     }
 
     unsafe fn create_fence(&self) -> Result<super::Fence, crate::DeviceError> {
-        let mut raw = native::Fence::null();
-        let hr = self.raw.CreateFence(
-            0,
-            d3d12::D3D12_FENCE_FLAG_NONE,
-            &d3d12::ID3D12Fence::uuidof(),
-            raw.mut_void(),
-        );
-        hr.into_device_result("Fence creation")?;
+        let hr = self
+            .raw
+            .CreateFence::<native::Fence>(0, Direct3D12::D3D12_FENCE_FLAG_NONE);
+        let raw = hr.into_device_result("Fence creation")?;
         Ok(super::Fence { raw })
     }
     unsafe fn destroy_fence(&self, fence: super::Fence) {
@@ -1493,14 +1529,16 @@ impl crate::Device<super::Api> for super::Device {
         let hr = fence.raw.set_event_on_completion(self.idler.event, value);
         hr.into_device_result("Set event")?;
 
-        match synchapi::WaitForSingleObject(self.idler.event.0, timeout_ms) {
-            winbase::WAIT_ABANDONED | winbase::WAIT_FAILED => Err(crate::DeviceError::Lost),
-            winbase::WAIT_OBJECT_0 => Ok(true),
-            winerror::WAIT_TIMEOUT => Ok(false),
-            other => {
-                log::error!("Unexpected wait status: 0x{:x}", other);
-                Err(crate::DeviceError::Lost)
-            }
+        let hr = Threading::WaitForSingleObject(self.idler.event.0, timeout_ms);
+        if hr == Threading::WAIT_ABANDONED || hr == Foundation::WAIT_FAILED.0 {
+            Err(crate::DeviceError::Lost)
+        } else if hr == Threading::WAIT_OBJECT_0 {
+            Ok(true)
+        } else if hr == Foundation::WAIT_TIMEOUT.0 {
+            Ok(false)
+        } else {
+            log::error!("Unexpected wait status: 0x{:x}", hr);
+            Err(crate::DeviceError::Lost)
         }
     }
 

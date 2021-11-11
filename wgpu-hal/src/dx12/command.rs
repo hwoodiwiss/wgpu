@@ -1,9 +1,15 @@
 use super::{conv, HResult as _};
 use std::{mem, ops::Range, ptr};
-use winapi::um::d3d12;
+use windows::{
+    runtime::Interface,
+    Win32::{
+        Foundation,
+        Graphics::Direct3D12::{self},
+    },
+};
 
-fn make_box(origin: &wgt::Origin3d, size: &crate::CopyExtent) -> d3d12::D3D12_BOX {
-    d3d12::D3D12_BOX {
+fn make_box(origin: &wgt::Origin3d, size: &crate::CopyExtent) -> Direct3D12::D3D12_BOX {
+    Direct3D12::D3D12_BOX {
         left: origin.x,
         top: origin.y,
         right: origin.x + size.width,
@@ -195,8 +201,8 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         };
 
         if let Some(label) = label {
-            let cwstr = conv::map_label(label);
-            list.SetName(cwstr.as_ptr());
+            let mut cwstr = conv::map_label(label);
+            list.SetName(Foundation::PWSTR(cwstr.as_mut_ptr()));
         }
 
         self.list = Some(list);
@@ -239,27 +245,29 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             let s0 = conv::map_buffer_usage_to_state(barrier.usage.start);
             let s1 = conv::map_buffer_usage_to_state(barrier.usage.end);
             if s0 != s1 {
-                let mut raw = d3d12::D3D12_RESOURCE_BARRIER {
-                    Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    u: mem::zeroed(),
+                let mut raw = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: mem::zeroed(),
                 };
-                *raw.u.Transition_mut() = d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: barrier.buffer.resource.as_mut_ptr(),
-                    Subresource: d3d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: s0,
-                    StateAfter: s1,
-                };
+                raw.Anonymous.Transition =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: Some(barrier.buffer.resource.as_unknown().cast::<_>().unwrap()),
+                        Subresource: Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: s0,
+                        StateAfter: s1,
+                    });
                 self.temp.barriers.push(raw);
             } else if barrier.usage.start == crate::BufferUses::STORAGE_WRITE {
-                let mut raw = d3d12::D3D12_RESOURCE_BARRIER {
-                    Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    u: mem::zeroed(),
+                let mut raw = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: mem::zeroed(),
                 };
-                *raw.u.UAV_mut() = d3d12::D3D12_RESOURCE_UAV_BARRIER {
-                    pResource: barrier.buffer.resource.as_mut_ptr(),
-                };
+                raw.Anonymous.UAV =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: Some(barrier.buffer.resource.as_unknown().cast::<_>().unwrap()),
+                    });
                 self.temp.barriers.push(raw);
             }
         }
@@ -289,17 +297,18 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             let s0 = conv::map_texture_usage_to_state(barrier.usage.start);
             let s1 = conv::map_texture_usage_to_state(barrier.usage.end);
             if s0 != s1 {
-                let mut raw = d3d12::D3D12_RESOURCE_BARRIER {
-                    Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    u: mem::zeroed(),
+                let mut raw = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: mem::zeroed(),
                 };
-                *raw.u.Transition_mut() = d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: barrier.texture.resource.as_mut_ptr(),
-                    Subresource: d3d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: s0,
-                    StateAfter: s1,
-                };
+                raw.Anonymous.Transition =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: Some(barrier.texture.resource.as_unknown().cast::<_>().unwrap()),
+                        Subresource: Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: s0,
+                        StateAfter: s1,
+                    });
 
                 let mip_level_count = match barrier.range.mip_level_count {
                     Some(count) => count.get(),
@@ -322,24 +331,37 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     // Generate barrier for each layer/level combination.
                     for rel_mip_level in 0..mip_level_count {
                         for rel_array_layer in 0..array_layer_count {
-                            raw.u.Transition_mut().Subresource = barrier.texture.calc_subresource(
-                                barrier.range.base_mip_level + rel_mip_level,
-                                barrier.range.base_array_layer + rel_array_layer,
-                                0,
+                            let mut raw: Direct3D12::D3D12_RESOURCE_BARRIER =
+                                mem::transmute_copy(&raw);
+                            ptr::write(
+                                &mut raw.Anonymous.Transition,
+                                mem::ManuallyDrop::new(
+                                    Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                                        Subresource: barrier.texture.calc_subresource(
+                                            barrier.range.base_mip_level + rel_mip_level,
+                                            barrier.range.base_array_layer + rel_array_layer,
+                                            0,
+                                        ),
+                                        pResource: raw.Anonymous.Transition.pResource.clone(),
+                                        StateBefore: raw.Anonymous.Transition.StateBefore.clone(),
+                                        StateAfter: raw.Anonymous.Transition.StateAfter.clone(),
+                                    },
+                                ),
                             );
                             self.temp.barriers.push(raw);
                         }
                     }
                 }
             } else if barrier.usage.start == crate::TextureUses::STORAGE_WRITE {
-                let mut raw = d3d12::D3D12_RESOURCE_BARRIER {
-                    Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    u: mem::zeroed(),
+                let mut raw = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: mem::zeroed(),
                 };
-                *raw.u.UAV_mut() = d3d12::D3D12_RESOURCE_UAV_BARRIER {
-                    pResource: barrier.texture.resource.as_mut_ptr(),
-                };
+                raw.Anonymous.UAV =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: Some(barrier.texture.resource.as_unknown().cast::<_>().unwrap()),
+                    });
                 self.temp.barriers.push(raw);
             }
         }
@@ -356,13 +378,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         let mut offset = range.start;
         while offset < range.end {
             let size = super::ZERO_BUFFER_SIZE.min(range.end - offset);
-            list.CopyBufferRegion(
-                buffer.resource.as_mut_ptr(),
-                offset,
-                self.shared.zero_buffer.as_mut_ptr(),
-                0,
-                size,
-            );
+            list.CopyBufferRegion(buffer.resource, offset, self.shared.zero_buffer, 0, size);
             offset += size;
         }
     }
@@ -378,9 +394,9 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         let list = self.list.unwrap();
         for r in regions {
             list.CopyBufferRegion(
-                dst.resource.as_mut_ptr(),
+                dst.resource,
                 r.dst_offset,
-                src.resource.as_mut_ptr(),
+                src.resource,
                 r.src_offset,
                 r.size.get(),
             );
@@ -397,21 +413,21 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         T: Iterator<Item = crate::TextureCopy>,
     {
         let list = self.list.unwrap();
-        let mut src_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: src.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            u: mem::zeroed(),
+        let mut src_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(src.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: mem::zeroed(),
         };
-        let mut dst_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: dst.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            u: mem::zeroed(),
+        let mut dst_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(dst.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: mem::zeroed(),
         };
 
         for r in regions {
             let src_box = make_box(&r.src_base.origin, &r.size);
-            *src_location.u.SubresourceIndex_mut() = src.calc_subresource_for_copy(&r.src_base);
-            *dst_location.u.SubresourceIndex_mut() = dst.calc_subresource_for_copy(&r.dst_base);
+            src_location.Anonymous.SubresourceIndex = src.calc_subresource_for_copy(&r.src_base);
+            dst_location.Anonymous.SubresourceIndex = dst.calc_subresource_for_copy(&r.dst_base);
 
             list.CopyTextureRegion(
                 &dst_location,
@@ -433,37 +449,41 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         T: Iterator<Item = crate::BufferTextureCopy>,
     {
         let list = self.list.unwrap();
-        let mut src_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: src.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            u: mem::zeroed(),
+        let mut src_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(src.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: mem::zeroed(),
         };
-        let mut dst_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: dst.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            u: mem::zeroed(),
+        let mut dst_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(dst.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: mem::zeroed(),
         };
         let raw_format = conv::map_texture_format(dst.format);
 
         let block_size = dst.format.describe().block_dimensions.0 as u32;
         for r in regions {
             let src_box = make_box(&wgt::Origin3d::ZERO, &r.size);
-            *src_location.u.PlacedFootprint_mut() = d3d12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                Offset: r.buffer_layout.offset,
-                Footprint: d3d12::D3D12_SUBRESOURCE_FOOTPRINT {
-                    Format: raw_format,
-                    Width: r.size.width,
-                    Height: r
-                        .buffer_layout
-                        .rows_per_image
-                        .map_or(r.size.height, |count| count.get() * block_size),
-                    Depth: r.size.depth,
-                    RowPitch: r.buffer_layout.bytes_per_row.map_or(0, |count| {
-                        count.get().max(d3d12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
-                    }),
-                },
-            };
-            *dst_location.u.SubresourceIndex_mut() = dst.calc_subresource_for_copy(&r.texture_base);
+            src_location.Anonymous.PlacedFootprint =
+                Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: r.buffer_layout.offset,
+                    Footprint: Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: raw_format,
+                        Width: r.size.width,
+                        Height: r
+                            .buffer_layout
+                            .rows_per_image
+                            .map_or(r.size.height, |count| count.get() * block_size),
+                        Depth: r.size.depth,
+                        RowPitch: r.buffer_layout.bytes_per_row.map_or(0, |count| {
+                            count
+                                .get()
+                                .max(Direct3D12::D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
+                        }),
+                    },
+                };
+            dst_location.Anonymous.SubresourceIndex =
+                dst.calc_subresource_for_copy(&r.texture_base);
 
             list.CopyTextureRegion(
                 &dst_location,
@@ -486,56 +506,52 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         T: Iterator<Item = crate::BufferTextureCopy>,
     {
         let list = self.list.unwrap();
-        let mut src_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: src.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            u: mem::zeroed(),
+        let mut src_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(src.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: mem::zeroed(),
         };
-        let mut dst_location = d3d12::D3D12_TEXTURE_COPY_LOCATION {
-            pResource: dst.resource.as_mut_ptr(),
-            Type: d3d12::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            u: mem::zeroed(),
+        let mut dst_location = Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: Some(dst.resource.as_unknown().cast::<_>().unwrap()),
+            Type: Direct3D12::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: mem::zeroed(),
         };
         let raw_format = conv::map_texture_format(src.format);
 
         let block_size = src.format.describe().block_dimensions.0 as u32;
         for r in regions {
             let src_box = make_box(&r.texture_base.origin, &r.size);
-            *src_location.u.SubresourceIndex_mut() = src.calc_subresource_for_copy(&r.texture_base);
-            *dst_location.u.PlacedFootprint_mut() = d3d12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                Offset: r.buffer_layout.offset,
-                Footprint: d3d12::D3D12_SUBRESOURCE_FOOTPRINT {
-                    Format: raw_format,
-                    Width: r.size.width,
-                    Height: r
-                        .buffer_layout
-                        .rows_per_image
-                        .map_or(r.size.height, |count| count.get() * block_size),
-                    Depth: r.size.depth,
-                    RowPitch: r.buffer_layout.bytes_per_row.map_or(0, |count| count.get()),
-                },
-            };
+            src_location.Anonymous.SubresourceIndex =
+                src.calc_subresource_for_copy(&r.texture_base);
+            dst_location.Anonymous.PlacedFootprint =
+                Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: r.buffer_layout.offset,
+                    Footprint: Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: raw_format,
+                        Width: r.size.width,
+                        Height: r
+                            .buffer_layout
+                            .rows_per_image
+                            .map_or(r.size.height, |count| count.get() * block_size),
+                        Depth: r.size.depth,
+                        RowPitch: r.buffer_layout.bytes_per_row.map_or(0, |count| count.get()),
+                    },
+                };
 
             list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, &src_box);
         }
     }
 
     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
-        self.list
-            .unwrap()
-            .BeginQuery(set.raw.as_mut_ptr(), set.raw_ty, index);
+        self.list.unwrap().BeginQuery(set.raw, set.raw_ty, index);
     }
     unsafe fn end_query(&mut self, set: &super::QuerySet, index: u32) {
-        self.list
-            .unwrap()
-            .EndQuery(set.raw.as_mut_ptr(), set.raw_ty, index);
+        self.list.unwrap().EndQuery(set.raw, set.raw_ty, index);
     }
     unsafe fn write_timestamp(&mut self, set: &super::QuerySet, index: u32) {
-        self.list.unwrap().EndQuery(
-            set.raw.as_mut_ptr(),
-            d3d12::D3D12_QUERY_TYPE_TIMESTAMP,
-            index,
-        );
+        self.list
+            .unwrap()
+            .EndQuery(set.raw, Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP, index);
     }
     unsafe fn reset_queries(&mut self, _set: &super::QuerySet, _range: Range<u32>) {
         // nothing to do here
@@ -549,11 +565,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         _stride: wgt::BufferSize,
     ) {
         self.list.unwrap().ResolveQueryData(
-            set.raw.as_mut_ptr(),
+            set.raw,
             set.raw_ty,
             range.start,
             range.end - range.start,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
         );
     }
@@ -582,7 +598,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         list.OMSetRenderTargets(
             desc.color_attachments.len() as u32,
             color_views.as_ptr(),
-            0,
+            Foundation::BOOL(0),
             ds_view,
         );
 
@@ -625,7 +641,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             }
         }
 
-        let raw_vp = d3d12::D3D12_VIEWPORT {
+        let raw_vp = Direct3D12::D3D12_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
             Width: desc.extent.width as f32,
@@ -633,7 +649,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
-        let raw_rect = d3d12::D3D12_RECT {
+        let raw_rect = Foundation::RECT {
             left: 0,
             top: 0,
             right: desc.extent.width as i32,
@@ -651,27 +667,31 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             // All the targets are expected to be in `COLOR_TARGET` state,
             // but D3D12 has special source/destination states for the resolves.
             for resolve in self.pass.resolves.iter() {
-                let mut barrier = d3d12::D3D12_RESOURCE_BARRIER {
-                    Type: d3d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: d3d12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    u: mem::zeroed(),
+                let mut barrier = Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: mem::zeroed(),
                 };
                 //Note: this assumes `D3D12_RESOURCE_STATE_RENDER_TARGET`.
                 // If it's not the case, we can include the `TextureUses` in `PassResove`.
-                *barrier.u.Transition_mut() = d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: resolve.src.0.as_mut_ptr(),
-                    Subresource: resolve.src.1,
-                    StateBefore: d3d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    StateAfter: d3d12::D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-                };
+                barrier.Anonymous.Transition =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: Some(resolve.src.0.as_unknown().cast::<_>().unwrap()),
+                        Subresource: resolve.src.1,
+                        StateBefore: Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        StateAfter: Direct3D12::D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                    });
+                let mut dst_barrier: Direct3D12::D3D12_RESOURCE_BARRIER =
+                    mem::transmute_copy(&barrier);
                 self.temp.barriers.push(barrier);
-                *barrier.u.Transition_mut() = d3d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: resolve.dst.0.as_mut_ptr(),
-                    Subresource: resolve.dst.1,
-                    StateBefore: d3d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    StateAfter: d3d12::D3D12_RESOURCE_STATE_RESOLVE_DEST,
-                };
-                self.temp.barriers.push(barrier);
+                dst_barrier.Anonymous.Transition =
+                    mem::ManuallyDrop::new(Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: Some(resolve.dst.0.as_unknown().cast::<_>().unwrap()),
+                        Subresource: resolve.dst.1,
+                        StateBefore: Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        StateAfter: Direct3D12::D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                    });
+                self.temp.barriers.push(dst_barrier);
             }
 
             if !self.temp.barriers.is_empty() {
@@ -682,18 +702,23 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             for resolve in self.pass.resolves.iter() {
                 profiling::scope!("ID3D12GraphicsCommandList::ResolveSubresource");
                 list.ResolveSubresource(
-                    resolve.dst.0.as_mut_ptr(),
+                    resolve.dst.0,
                     resolve.dst.1,
-                    resolve.src.0.as_mut_ptr(),
+                    resolve.src.0,
                     resolve.src.1,
                     resolve.format,
                 );
             }
 
             // Flip all the barriers to reverse, back into `COLOR_TARGET`.
-            for barrier in self.temp.barriers.iter_mut() {
-                let transition = barrier.u.Transition_mut();
-                mem::swap(&mut transition.StateBefore, &mut transition.StateAfter);
+            for transition in self.temp.barriers.iter_mut().map(|m| {
+                &mut m.Anonymous.Transition
+                    as *mut mem::ManuallyDrop<Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER>
+            }) {
+                mem::swap(
+                    &mut (*transition).StateBefore,
+                    &mut (*transition).StateAfter,
+                );
             }
             if !self.temp.barriers.is_empty() {
                 profiling::scope!("ID3D12GraphicsCommandList::ResourceBarrier");
@@ -829,7 +854,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     }
 
     unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {
-        let raw_vp = d3d12::D3D12_VIEWPORT {
+        let raw_vp = Direct3D12::D3D12_VIEWPORT {
             TopLeftX: rect.x,
             TopLeftY: rect.y,
             Width: rect.w,
@@ -840,7 +865,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         self.list.unwrap().RSSetViewports(1, &raw_vp);
     }
     unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {
-        let raw_rect = d3d12::D3D12_RECT {
+        let raw_rect = Foundation::RECT {
             left: rect.x as i32,
             top: rect.y as i32,
             right: (rect.x + rect.w) as i32,
@@ -892,11 +917,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         self.prepare_draw(0, 0);
         self.list.unwrap().ExecuteIndirect(
-            self.shared.cmd_signatures.draw.as_mut_ptr(),
+            self.shared.cmd_signatures.draw,
             draw_count,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
-            ptr::null_mut(),
+            None,
             0,
         );
     }
@@ -908,11 +933,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         self.prepare_draw(0, 0);
         self.list.unwrap().ExecuteIndirect(
-            self.shared.cmd_signatures.draw_indexed.as_mut_ptr(),
+            self.shared.cmd_signatures.draw_indexed,
             draw_count,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
-            ptr::null_mut(),
+            None,
             0,
         );
     }
@@ -926,11 +951,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         self.prepare_draw(0, 0);
         self.list.unwrap().ExecuteIndirect(
-            self.shared.cmd_signatures.draw.as_mut_ptr(),
+            self.shared.cmd_signatures.draw,
             max_count,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
-            count_buffer.resource.as_mut_ptr(),
+            count_buffer.resource,
             count_offset,
         );
     }
@@ -944,11 +969,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     ) {
         self.prepare_draw(0, 0);
         self.list.unwrap().ExecuteIndirect(
-            self.shared.cmd_signatures.draw_indexed.as_mut_ptr(),
+            self.shared.cmd_signatures.draw_indexed,
             max_count,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
-            count_buffer.resource.as_mut_ptr(),
+            count_buffer.resource,
             count_offset,
         );
     }
@@ -982,11 +1007,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
         self.prepare_dispatch([0; 3]);
         //TODO: update special constants indirectly
         self.list.unwrap().ExecuteIndirect(
-            self.shared.cmd_signatures.dispatch.as_mut_ptr(),
+            self.shared.cmd_signatures.dispatch,
             1,
-            buffer.resource.as_mut_ptr(),
+            buffer.resource,
             offset,
-            ptr::null_mut(),
+            None,
             0,
         );
     }

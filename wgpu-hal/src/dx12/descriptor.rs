@@ -3,6 +3,7 @@ use bit_set::BitSet;
 use parking_lot::Mutex;
 use range_alloc::RangeAllocator;
 use std::fmt;
+use windows::Win32::Graphics::Direct3D12;
 
 const HEAP_SIZE_FIXED: usize = 64;
 
@@ -118,12 +119,13 @@ struct FixedSizeHeap {
 
 impl FixedSizeHeap {
     fn new(device: native::Device, ty: native::DescriptorHeapType) -> Self {
-        let (heap, _hr) = device.create_descriptor_heap(
+        let hr = device.create_descriptor_heap(
             HEAP_SIZE_FIXED as _,
             ty,
             native::DescriptorHeapFlags::empty(),
             0,
         );
+        let heap = hr.expect("msg");
 
         Self {
             handle_size: device.get_descriptor_increment_size(ty) as _,
@@ -303,7 +305,7 @@ pub(super) unsafe fn upload(
         count,
         src.stage.as_ptr(),
         dummy_copy_counts.as_ptr(),
-        dst.ty as u32,
+        Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE(dst.ty as _),
     );
     Ok(dst.at(index, count as u64))
 }
